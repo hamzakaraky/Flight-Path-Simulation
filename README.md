@@ -6,7 +6,7 @@ The system calculates the most efficient route using Dijkstra's algorithm.
 
 ## Team Members
 - mahmoud malhi - Dijkstra algorithm and shortest path testing
-- hamza karkay - Raylib GUI and graph drawing
+- hamza karaky - Raylib GUI and graph drawing
 - ibrahem hroub - OS integration and file parsing
 - qais hijazi - Testing, documentation, and GitHub management
 

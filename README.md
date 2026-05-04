@@ -5,10 +5,10 @@ This project simulates a global flight network where airports are nodes and flig
 The system calculates the most efficient route using Dijkstra's algorithm.
 
 ## Team Members
-* mahmoud malhi - Responsibility (e.g., Dijkstra Algorithm)
-* hamza karkay - Responsibility (e.g., Raylib GUI)
-* ibrahem hroub - Responsibility (e.g., OS Integration)
-* qais hijazi- Responsibility (e.g., Testing & Documentation)
+- mahmoud malhi - Dijkstra algorithm and shortest path testing
+- hamza karkay - Raylib GUI and graph drawing
+- ibrahem hroub - OS integration and file parsing
+- qais hijazi - Testing, documentation, and GitHub management
 
 ## Technical Stack
 * Language: C
@@ -18,3 +18,16 @@ The system calculates the most efficient route using Dijkstra's algorithm.
 ## How to Run
 1. Build Milestone 1: `make milestone1`
 2. Run: `./dijkstra <filename>`
+## Milestone 2
+Build:
+make milestone2
+
+Run:
+./sim <filename>
+
+## Milestone 3
+Build:
+make milestone3
+
+Run:
+./sim <filename>

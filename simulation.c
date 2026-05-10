@@ -1,5 +1,19 @@
 #include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+
+static void usleep(unsigned int usec) {
+    Sleep((usec + 999) / 1000);
+}
+
+static unsigned int sleep(unsigned int seconds) {
+    Sleep(seconds * 1000);
+    return 0;
+}
+#else
 #include <unistd.h> // For usleep() and sleep()
+#endif
+
 #include "simulation.h"
 
 /**

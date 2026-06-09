@@ -18,6 +18,7 @@ The system calculates the most efficient route using Dijkstra's algorithm.
 ## How to Run
 1. Build Milestone 1: `make milestone1`
 2. Run: `./dijkstra <filename>`
+
 ## Milestone 2
 Build:
 make milestone2
@@ -31,3 +32,23 @@ make milestone3
 
 Run:
 ./sim <filename>
+
+## Milestone 4 / 5 / 6
+Build:
+make milestone4
+make milestone5
+make milestone6
+
+Run:
+./sim <filename>
+
+The advanced input format uses a `#travelers` section after the graph definition:
+```
+7 10
+0 1 2
+...edges...
+#travelers 2
+0 6
+1 4
+```
+If the `#travelers` marker is omitted and only one source-destination pair is provided after the edges, the program falls back to legacy single-traveler input.

@@ -12,43 +12,124 @@ The system calculates the most efficient route using Dijkstra's algorithm.
 
 ## Technical Stack
 * Language: C
-* Graphics: Raylib
-* Platform: Linux
+* Graphics: Raylib (UCRT64 build from MSYS2)
+* Platform: Windows (MSYS2 UCRT64)
 
-## How to Run
-1. Build Milestone 1: `make milestone1`
-2. Run: `./dijkstra <filename>`
+## Prerequisites (Windows / MSYS2 UCRT64)
 
-## Milestone 2
+Install Raylib via the MSYS2 UCRT64 shell:
+```bash
+pacman -S mingw-w64-ucrt-x86_64-raylib
+```
+
+The Makefile uses `/c/msys64/mingw64/bin/gcc` with headers and libs from
+`/c/msys64/ucrt64/include` and `/c/msys64/ucrt64/lib`. Adjust `CC_WIN`,
+`IFLAGS`, and `LFLAGS` in the Makefile if your MSYS2 is installed elsewhere.
+
+## Milestone 1 — Dijkstra CLI
+
 Build:
+```bash
+make milestone1
+```
+Run:
+```bash
+./dijkstra <input_file>
+```
+Run automated tests:
+```bash
+bash tests/run_tests.sh ./dijkstra
+```
+
+## Milestone 2 — Graph GUI
+
+Build:
+```bash
 make milestone2
-
+```
 Run:
-./sim <filename>
+```bash
+./sim.exe <input_file>
+```
 
-## Milestone 3
+## Milestone 3 — Animated Traveler
+
 Build:
+```bash
 make milestone3
-
+```
 Run:
-./sim <filename>
+```bash
+./sim.exe <input_file>
+```
 
-## Milestone 4 / 5 / 6
+## Milestone 4 — Multi-Traveler with fork()
+
+Each traveler runs in its own child process. The parent animates all travelers
+simultaneously using pre-computed paths.
+
 Build:
+```bash
 make milestone4
-make milestone5
-make milestone6
-
+```
 Run:
-./sim <filename>
+```bash
+./sim.exe multi.txt
+```
 
-The advanced input format uses a `#travelers` section after the graph definition:
+## Milestone 5 — IPC via pipes
+
+Child processes send real-time position/state updates to the parent over
+non-blocking pipes. The GUI reflects live child process state.
+
+Build:
+```bash
+make milestone5
 ```
-7 10
-0 1 2
-...edges...
-#travelers 2
-0 6
-1 4
+Run:
+```bash
+./sim.exe multi.txt
 ```
-If the `#travelers` marker is omitted and only one source-destination pair is provided after the edges, the program falls back to legacy single-traveler input.
+
+## Milestone 6 — Semaphore-based node locking
+
+Adds one process-shared semaphore per node (via mmap + sem_init pshared=1).
+Travelers must acquire the destination node's semaphore before entering it,
+preventing simultaneous occupation.
+
+Build:
+```bash
+make milestone6
+```
+Run:
+```bash
+./sim.exe sync_test.txt    # stress test: 3 travelers competing for node 2
+./sim.exe multi.txt        # 3 travelers, 7-node graph
+```
+
+## Input Format
+
+### Single traveler (legacy)
+```
+<nodes> <edges>
+src dst weight
+...
+src dst
+```
+
+### Multiple travelers
+```
+<nodes> <edges>
+src dst weight
+...
+<traveler_count>
+src dst
+src dst
+```
+Or with explicit header:
+```
+#travelers <count>
+src dst
+```
+
+Console output format: `[PID=XXXX] arrived at node N | next node: M`

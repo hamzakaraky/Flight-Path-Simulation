@@ -228,6 +228,39 @@ static bool loadGraph(const char *path, Graph *g, TravelerDef travelers[], int *
             return true;
         }
 
+        /* bare integer on its own line = traveler count */
+        int count;
+        if (sscanf(line, "%d", &count) == 1) {
+            if (count <= 0 || count > MAX_TRAVELERS) {
+                fprintf(stderr, "Invalid travelers count\n");
+                fclose(file);
+                return false;
+            }
+            for (int t = 0; t < count; t++) {
+                char tline[256];
+                while (fgets(tline, sizeof(tline), file)) {
+                    trimLine(tline);
+                    if (tline[0] != '\0') break;
+                }
+                int tsrc, tdst;
+                if (sscanf(tline, "%d %d", &tsrc, &tdst) != 2) {
+                    fprintf(stderr, "Invalid traveler data\n");
+                    fclose(file);
+                    return false;
+                }
+                if (tsrc < 0 || tdst < 0 || tsrc >= g->n || tdst >= g->n) {
+                    fprintf(stderr, "Invalid traveler nodes\n");
+                    fclose(file);
+                    return false;
+                }
+                travelers[*travelers_count].source = tsrc;
+                travelers[*travelers_count].destination = tdst;
+                (*travelers_count)++;
+            }
+            fclose(file);
+            return true;
+        }
+
         fprintf(stderr, "Invalid traveler or section header\n");
         fclose(file);
         return false;
@@ -373,6 +406,7 @@ static void sendDone(int fd, pid_t pid, int traveler_id, int current_node, float
 
 #endif
 
+#if !defined(MS5) && !defined(MS6)
 static double estimateTravelSeconds(int path[], int path_len, const Graph *g) {
     if (path_len <= 1) return 1.0;
     double seconds = 0.0;
@@ -382,6 +416,7 @@ static double estimateTravelSeconds(int path[], int path_len, const Graph *g) {
     if (path_len > 2) seconds += (path_len - 2) * WAIT_TIME;
     return seconds;
 }
+#endif
 
 static void initializeTravelers(Traveler travelers[], TravelerDef defs[], int traveler_count, Vector2 positions[]) {
     Color colors[MAX_TRAVELERS] = {MAROON, DARKGREEN, DARKBLUE, ORANGE, PINK, SKYBLUE, VIOLET, YELLOW};
@@ -427,7 +462,7 @@ static void computePathsInParent(Graph *g, Traveler travelers[], int traveler_co
 static void childProcessStage4(int traveler_id, Traveler traveler, Graph *g) {
     (void)traveler_id;
     pid_t pid = getpid();
-    printf("[%d] started\n", pid);
+    printf("[PID=%d] started\n", pid);
     int path_len = traveler.path_len;
     double seconds = 0.0;
     if (path_len > 0) {
@@ -541,7 +576,7 @@ static void updateTravelerFromMessage(Traveler *traveler, const IPCMessage *msg)
     traveler->y = msg->y;
     traveler->state = msg->state;
     if (msg->event == EVENT_ARRIVE) {
-        printf("[%d] arrived at node %d | next node: %d\n", msg->pid, msg->current_node, msg->next_node);
+        printf("[PID=%d] arrived at node %d | next node: %d\n", msg->pid, msg->current_node, msg->next_node);
     } else if (msg->event == EVENT_DONE) {
         traveler->finished = true;
         traveler->state = STATE_FINISHED;
@@ -618,6 +653,7 @@ static void drawTravelers(Traveler travelers[], int traveler_count) {
     }
 }
 
+#if !defined(MS5) && !defined(MS6)
 static void updateSimpleAnimation(Traveler *traveler, const Graph *g, Vector2 positions[]) {
     if (traveler->finished || traveler->path_len <= 1) {
         if (traveler->path_len <= 1) {
@@ -674,6 +710,7 @@ static void updateSimpleAnimation(Traveler *traveler, const Graph *g, Vector2 po
         }
     }
 }
+#endif
 
 #if !defined(MS5) && !defined(MS6)
 static void runStage4(Graph *g, TravelerDef defs[], int traveler_count, Vector2 positions[]) {

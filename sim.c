@@ -1,60 +1,335 @@
-/*
- * Milestone 3 – Graph GUI Visualization & Animation
- * OS Project – Directed Weighted Graph Simulation
- */
-
+#define _POSIX_C_SOURCE 200809L
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <semaphore.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <math.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
 #include <raylib.h>
 
-/* ─── Constants ─────────────────────────────────────────────── */
-#define INF          1000000000
-#define MAX_NODES    15
-#define SCREEN_W     1100
-#define SCREEN_H     750
-#define NODE_RADIUS  26
-#define ARROW_HEAD   12
-#define PI           3.14159265358979323846f
+#define INF 1000000000
+#define MAX_NODES 50
+#define MAX_TRAVELERS 20
+#define SCREEN_W 1280
+#define SCREEN_H 800
+#define NODE_RADIUS 26
+#define ARROW_HEAD 12
+#define JUMP_TIME 0.3f
+#define WAIT_TIME 1.0f
+#define PI 3.14159265358979323846f
 
-/* Animation Constants */
-#define JUMP_TIME    0.3f  /* 300ms per jump */
-#define WAIT_TIME    1.0f  /* 1 second wait at nodes */
-
-/* ─── Structures ─────────────────────────────────────────────── */
 typedef struct {
-    int n, m;
+    int n;
+    int m;
     int weight[MAX_NODES][MAX_NODES];
 } Graph;
 
-typedef struct { float x, y; } Vec2;
+typedef struct {
+    int source;
+    int destination;
+} TravelerDef;
 
-/* Animation States */
 typedef enum {
-    ANIM_IDLE,
-    ANIM_JUMPING,
-    ANIM_WAITING,
-    ANIM_FINISHED,
-    ANIM_NO_PATH
-} AnimState;
+    STATE_ACTIVE = 1,
+    STATE_WAITING,
+    STATE_BLOCKED,
+    STATE_FINISHED,
+} TravelerStateType;
 
-/* ─── Dijkstra ───────────────────────────────────────────────── */
-static int minDist(int dist[], int visited[], int n) {
-    int min = INF, idx = -1;
-    for (int i = 0; i < n; i++)
-        if (!visited[i] && dist[i] < min) { min = dist[i]; idx = i; }
+typedef enum {
+    EVENT_NONE = 0,
+    EVENT_MOVE,
+    EVENT_ARRIVE,
+    EVENT_WAIT,
+    EVENT_DONE,
+} EventType;
+
+typedef struct {
+    pid_t pid;
+    int traveler_id;
+    int current_node;
+    int next_node;
+    float x;
+    float y;
+    int state;
+    int event;
+} IPCMessage;
+
+typedef struct {
+    int id;
+    pid_t pid;
+    Color color;
+    float x;
+    float y;
+    int source;
+    int destination;
+    int current_node;
+    int next_node;
+    int path[MAX_NODES];
+    int path_len;
+    int path_index;
+    int jump_count;
+    int state;
+    bool finished;
+    double last_time;
+} Traveler;
+
+static sem_t *node_sems = NULL;
+
+#ifdef MS6
+static bool initNodeSemaphores(int n) {
+    node_sems = mmap(NULL, sizeof(sem_t) * MAX_NODES,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0);
+    if (node_sems == MAP_FAILED) {
+        perror("mmap");
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (sem_init(&node_sems[i], 1, 1) != 0) {
+            perror("sem_init");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void destroyNodeSemaphores(int n) {
+    if (node_sems == NULL) return;
+    for (int i = 0; i < n; i++) {
+        sem_destroy(&node_sems[i]);
+    }
+    munmap(node_sems, sizeof(sem_t) * MAX_NODES);
+    node_sems = NULL;
+}
+#endif
+
+static void trimLine(char *line) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[--len] = '\0';
+    }
+}
+
+static bool loadGraph(const char *path, Graph *g, TravelerDef travelers[], int *travelers_count) {
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        perror("fopen");
+        return false;
+    }
+
+    if (fscanf(file, "%d %d", &g->n, &g->m) != 2) {
+        fprintf(stderr, "Invalid graph header\n");
+        fclose(file);
+        return false;
+    }
+    if (g->n <= 0 || g->n > MAX_NODES || g->m < 0) {
+        fprintf(stderr, "Invalid graph size or edge count\n");
+        fclose(file);
+        return false;
+    }
+
+    for (int i = 0; i < g->n; i++) {
+        for (int j = 0; j < g->n; j++) {
+            g->weight[i][j] = INF;
+        }
+    }
+
+    for (int i = 0; i < g->m; i++) {
+        int s, d, w;
+        if (fscanf(file, "%d %d %d", &s, &d, &w) != 3) {
+            fprintf(stderr, "Invalid edge line\n");
+            fclose(file);
+            return false;
+        }
+        if (s < 0 || d < 0 || w < 0 || s >= g->n || d >= g->n) {
+            fprintf(stderr, "Invalid edge values\n");
+            fclose(file);
+            return false;
+        }
+        g->weight[s][d] = w;
+    }
+
+    *travelers_count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        trimLine(line);
+        if (line[0] == '\0') continue;
+
+        if (strncmp(line, "#travelers", 10) == 0) {
+            int count = 0;
+            if (sscanf(line + 10, "%d", &count) != 1) {
+                if (!fgets(line, sizeof(line), file)) {
+                    fprintf(stderr, "Invalid travelers section\n");
+                    fclose(file);
+                    return false;
+                }
+                trimLine(line);
+                if (sscanf(line, "%d", &count) != 1) {
+                    fprintf(stderr, "Invalid travelers count\n");
+                    fclose(file);
+                    return false;
+                }
+            }
+            if (count <= 0 || count > MAX_TRAVELERS) {
+                fprintf(stderr, "Invalid travelers count\n");
+                fclose(file);
+                return false;
+            }
+            for (int t = 0; t < count; t++) {
+                if (!fgets(line, sizeof(line), file)) {
+                    fprintf(stderr, "Incomplete travelers list\n");
+                    fclose(file);
+                    return false;
+                }
+                trimLine(line);
+                if (line[0] == '\0') {
+                    t--;
+                    continue;
+                }
+                int src, dst;
+                if (sscanf(line, "%d %d", &src, &dst) != 2) {
+                    fprintf(stderr, "Invalid traveler data\n");
+                    fclose(file);
+                    return false;
+                }
+                if (src < 0 || dst < 0 || src >= g->n || dst >= g->n) {
+                    fprintf(stderr, "Invalid traveler nodes\n");
+                    fclose(file);
+                    return false;
+                }
+                travelers[*travelers_count].source = src;
+                travelers[*travelers_count].destination = dst;
+                (*travelers_count)++;
+            }
+            fclose(file);
+            return true;
+        }
+
+        int src, dst;
+        if (sscanf(line, "%d %d", &src, &dst) == 2) {
+            if (src < 0 || dst < 0 || src >= g->n || dst >= g->n) {
+                fprintf(stderr, "Invalid traveler nodes\n");
+                fclose(file);
+                return false;
+            }
+            travelers[0].source = src;
+            travelers[0].destination = dst;
+            *travelers_count = 1;
+            fclose(file);
+            return true;
+        }
+
+        /* bare integer on its own line = traveler count */
+        int count;
+        if (sscanf(line, "%d", &count) == 1) {
+            if (count <= 0 || count > MAX_TRAVELERS) {
+                fprintf(stderr, "Invalid travelers count\n");
+                fclose(file);
+                return false;
+            }
+            for (int t = 0; t < count; t++) {
+                char tline[256];
+                while (fgets(tline, sizeof(tline), file)) {
+                    trimLine(tline);
+                    if (tline[0] != '\0') break;
+                }
+                int tsrc, tdst;
+                if (sscanf(tline, "%d %d", &tsrc, &tdst) != 2) {
+                    fprintf(stderr, "Invalid traveler data\n");
+                    fclose(file);
+                    return false;
+                }
+                if (tsrc < 0 || tdst < 0 || tsrc >= g->n || tdst >= g->n) {
+                    fprintf(stderr, "Invalid traveler nodes\n");
+                    fclose(file);
+                    return false;
+                }
+                travelers[*travelers_count].source = tsrc;
+                travelers[*travelers_count].destination = tdst;
+                (*travelers_count)++;
+            }
+            fclose(file);
+            return true;
+        }
+
+        fprintf(stderr, "Invalid traveler or section header\n");
+        fclose(file);
+        return false;
+    }
+
+    fprintf(stderr, "Missing traveler section\n");
+    fclose(file);
+    return false;
+}
+
+static Vector2 nodePosition(int idx, int n, float cx, float cy, float radius) {
+    float angle = ((float)idx / (float)n) * 2.0f * PI - PI / 2.0f;
+    return (Vector2){cx + radius * cosf(angle), cy + radius * sinf(angle)};
+}
+
+static void drawArrow(Vector2 p1, Vector2 p2, Color color) {
+    float dx = p2.x - p1.x;
+    float dy = p2.y - p1.y;
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1e-6f) return;
+
+    float ux = dx / len;
+    float uy = dy / len;
+    Vector2 start = {p1.x + ux * NODE_RADIUS, p1.y + uy * NODE_RADIUS};
+    Vector2 end = {p2.x - ux * NODE_RADIUS, p2.y - uy * NODE_RADIUS};
+
+    DrawLineEx((Vector2){start.x, start.y}, (Vector2){end.x, end.y}, 2.5f, color);
+
+    float angle = atan2f(uy, ux);
+    Vector2 tip = {end.x, end.y};
+    Vector2 left = {end.x - ARROW_HEAD * cosf(angle - 0.4f), end.y - ARROW_HEAD * sinf(angle - 0.4f)};
+    Vector2 right = {end.x - ARROW_HEAD * cosf(angle + 0.4f), end.y - ARROW_HEAD * sinf(angle + 0.4f)};
+    DrawTriangle(tip, left, right, color);
+}
+
+static void drawBoldText(const char *text, int x, int y, int fontSize, Color color) {
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            if (dx == 0 && dy == 0) continue;
+            DrawText(text, x + dx, y + dy, fontSize, BLACK);
+        }
+    }
+    DrawText(text, x, y, fontSize, color);
+}
+
+static int minDistance(int dist[], int visited[], int n) {
+    int min = INF;
+    int idx = -1;
+    for (int i = 0; i < n; i++) {
+        if (!visited[i] && dist[i] < min) {
+            min = dist[i];
+            idx = i;
+        }
+    }
     return idx;
 }
 
-static int dijkstra(Graph *g, int src, int dst, int parent[]) {
-    int dist[MAX_NODES], visited[MAX_NODES];
-    for (int i = 0; i < g->n; i++) { dist[i] = INF; visited[i] = 0; parent[i] = -1; }
+static int dijkstra(const Graph *g, int src, int dst, int parent[]) {
+    int dist[MAX_NODES];
+    int visited[MAX_NODES];
+    for (int i = 0; i < g->n; i++) {
+        dist[i] = INF;
+        visited[i] = 0;
+        parent[i] = -1;
+    }
     dist[src] = 0;
 
-    for (int c = 0; c < g->n; c++) {
-        int u = minDist(dist, visited, g->n);
+    for (int i = 0; i < g->n; i++) {
+        int u = minDistance(dist, visited, g->n);
         if (u == -1) break;
         visited[u] = 1;
         for (int v = 0; v < g->n; v++) {
@@ -68,301 +343,527 @@ static int dijkstra(Graph *g, int src, int dst, int parent[]) {
     return dist[dst];
 }
 
-static void markPath(int parent[], int dst, bool onPath[][MAX_NODES]) {
+static void buildPath(int parent[], int dst, int path[], int *path_len) {
+    int tmp[MAX_NODES];
+    int count = 0;
     int cur = dst;
-    while (parent[cur] != -1) {
-        onPath[parent[cur]][cur] = true;
+    while (cur != -1 && count < MAX_NODES) {
+        tmp[count++] = cur;
         cur = parent[cur];
     }
-}
-
-/* ─── Geometry helpers ───────────────────────────────────────── */
-static Vec2 nodePos(int idx, int n, float cx, float cy, float r) {
-    float angle = (float)idx / (float)n * 2.0f * PI - PI / 2.0f;
-    return (Vec2){ cx + r * cosf(angle), cy + r * sinf(angle) };
-}
-
-static void drawArrow(Vec2 p1, Vec2 p2, Color color) {
-    float dx = p2.x - p1.x, dy = p2.y - p1.y;
-    float len = sqrtf(dx * dx + dy * dy);
-    if (len < 1.0f) return;
-    float ux = dx / len, uy = dy / len;
-
-    Vec2 a = { p1.x + ux * NODE_RADIUS, p1.y + uy * NODE_RADIUS };
-    Vec2 b = { p2.x - ux * NODE_RADIUS, p2.y - uy * NODE_RADIUS };
-
-    DrawLineEx((Vector2){ a.x, a.y }, (Vector2){ b.x, b.y }, 2.5f, color);
-
-    float angle = atan2f(uy, ux);
-    float spread = 0.42f; 
-    Vector2 tip  = { b.x, b.y };
-    Vector2 left = { b.x - ARROW_HEAD * cosf(angle - spread),
-                     b.y - ARROW_HEAD * sinf(angle - spread) };
-    Vector2 right= { b.x - ARROW_HEAD * cosf(angle + spread),
-                     b.y - ARROW_HEAD * sinf(angle + spread) };
-    DrawTriangle(tip, left, right, color);
-}
-
-/* ─── Bold text helper (fake bold + black outline) ───────────── */
-static void drawBoldText(const char *text, int x, int y, int fontSize, Color color) {
-    /* Draw black outline 8 directions around */
-    DrawText(text, x - 1, y,     fontSize, BLACK);
-    DrawText(text, x + 1, y,     fontSize, BLACK);
-    DrawText(text, x,     y - 1, fontSize, BLACK);
-    DrawText(text, x,     y + 1, fontSize, BLACK);
-    DrawText(text, x - 1, y - 1, fontSize, BLACK);
-    DrawText(text, x + 1, y - 1, fontSize, BLACK);
-    DrawText(text, x - 1, y + 1, fontSize, BLACK);
-    DrawText(text, x + 1, y + 1, fontSize, BLACK);
-    /* Draw the actual text on top */
-    DrawText(text, x, y, fontSize, color);
-}
-
-/* ─── Load graph ─────────────────────────────────────────────── */
-static bool loadGraph(const char *path, Graph *g, int *src, int *dst) {
-    FILE *f = fopen(path, "r");
-    if (!f) { printf("Error opening file\n"); return false; }
-
-    if (fscanf(f, "%d %d", &g->n, &g->m) != 2 || g->n <= 0 || g->m < 0 || g->n > MAX_NODES) {
-        printf("Invalid input\n"); fclose(f); return false;
+    *path_len = count;
+    for (int i = 0; i < count; i++) {
+        path[i] = tmp[count - 1 - i];
     }
+}
 
-    for (int i = 0; i < g->n; i++)
-        for (int j = 0; j < g->n; j++)
-            g->weight[i][j] = INF;
+#if defined(MS5) || defined(MS6)
+static bool setNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
 
-    for (int i = 0; i < g->m; i++) {
-        int s, d, w;
-        if (fscanf(f, "%d %d %d", &s, &d, &w) != 3 || s < 0 || d < 0 || w < 0 || s >= g->n || d >= g->n) {
-            printf("Invalid input\n"); fclose(f); return false;
+static void sleepMs(long ms) {
+    struct timespec req;
+    req.tv_sec = ms / 1000;
+    req.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+        ;
+    }
+}
+
+static bool writeMessage(int fd, const IPCMessage *msg) {
+    ssize_t written = write(fd, msg, sizeof(*msg));
+    if (written == (ssize_t)sizeof(*msg)) return true;
+    if (written == -1 && errno == EINTR) return writeMessage(fd, msg);
+    if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        sleepMs(50);
+        return writeMessage(fd, msg);
+    }
+    return false;
+}
+
+static void sendMove(int fd, pid_t pid, int traveler_id, int current_node, int next_node, float x, float y) {
+    IPCMessage msg = {pid, traveler_id, current_node, next_node, x, y, STATE_ACTIVE, EVENT_MOVE};
+    writeMessage(fd, &msg);
+}
+
+static void sendArrival(int fd, pid_t pid, int traveler_id, int current_node, int next_node, float x, float y) {
+    IPCMessage msg = {pid, traveler_id, current_node, next_node, x, y, STATE_ACTIVE, EVENT_ARRIVE};
+    writeMessage(fd, &msg);
+}
+
+static void sendWait(int fd, pid_t pid, int traveler_id, int current_node, int next_node, float x, float y, int state) {
+    IPCMessage msg = {pid, traveler_id, current_node, next_node, x, y, state, EVENT_WAIT};
+    writeMessage(fd, &msg);
+}
+
+static void sendDone(int fd, pid_t pid, int traveler_id, int current_node, float x, float y) {
+    IPCMessage msg = {pid, traveler_id, current_node, -1, x, y, STATE_FINISHED, EVENT_DONE};
+    writeMessage(fd, &msg);
+}
+
+#endif
+
+#if !defined(MS5) && !defined(MS6)
+static double estimateTravelSeconds(int path[], int path_len, const Graph *g) {
+    if (path_len <= 1) return 1.0;
+    double seconds = 0.0;
+    for (int i = 0; i < path_len - 1; i++) {
+        seconds += g->weight[path[i]][path[i + 1]] * JUMP_TIME;
+    }
+    if (path_len > 2) seconds += (path_len - 2) * WAIT_TIME;
+    return seconds;
+}
+#endif
+
+static void initializeTravelers(Traveler travelers[], TravelerDef defs[], int traveler_count, Vector2 positions[]) {
+    Color colors[MAX_TRAVELERS] = {MAROON, DARKGREEN, DARKBLUE, ORANGE, PINK, SKYBLUE, VIOLET, YELLOW};
+    for (int i = 0; i < traveler_count; i++) {
+        travelers[i].id = i;
+        travelers[i].pid = 0;
+        travelers[i].color = colors[i % 8];
+        travelers[i].source = defs[i].source;
+        travelers[i].destination = defs[i].destination;
+        travelers[i].x = positions[defs[i].source].x;
+        travelers[i].y = positions[defs[i].source].y;
+        travelers[i].current_node = defs[i].source;
+        travelers[i].next_node = defs[i].destination;
+        travelers[i].path_len = 0;
+        travelers[i].path_index = 0;
+        travelers[i].jump_count = 0;
+        travelers[i].state = STATE_ACTIVE;
+        travelers[i].finished = false;
+        travelers[i].last_time = GetTime();
+    }
+}
+
+#if !defined(MS5) && !defined(MS6)
+static void computePathsInParent(Graph *g, Traveler travelers[], int traveler_count) {
+    for (int i = 0; i < traveler_count; i++) {
+        int parent[MAX_NODES];
+        int dist = dijkstra(g, travelers[i].source, travelers[i].destination, parent);
+        if (dist == INF) {
+            travelers[i].path_len = 0;
+            travelers[i].finished = true;
+            travelers[i].state = STATE_FINISHED;
+            continue;
         }
-        g->weight[s][d] = w;
+        buildPath(parent, travelers[i].destination, travelers[i].path, &travelers[i].path_len);
+        travelers[i].path_index = 0;
+        travelers[i].jump_count = 0;
+        travelers[i].current_node = travelers[i].path[0];
+        travelers[i].next_node = (travelers[i].path_len > 1) ? travelers[i].path[1] : -1;
+        travelers[i].state = STATE_ACTIVE;
     }
-
-    if (fscanf(f, "%d %d", src, dst) != 2 || *src < 0 || *dst < 0 || *src >= g->n || *dst >= g->n) {
-        printf("Invalid input\n"); fclose(f); return false;
-    }
-
-    fclose(f);
-    return true;
 }
 
-/* ─── Main ───────────────────────────────────────────────────── */
-int main(int argc, char *argv[]) {
-    if (argc != 2) { printf("Usage: ./sim <file_name>\n"); return 1; }
+static void childProcessStage4(int traveler_id, Traveler traveler, Graph *g) {
+    (void)traveler_id;
+    pid_t pid = getpid();
+    printf("[PID=%d] started\n", pid);
+    int path_len = traveler.path_len;
+    double seconds = 0.0;
+    if (path_len > 0) {
+        seconds = estimateTravelSeconds(traveler.path, path_len, g);
+    } else {
+        seconds = WAIT_TIME;
+    }
+    sleep((unsigned int)ceil(seconds));
+    exit(0);
+}
+#endif
 
-    Graph g;
-    int qSrc, qDst;
-    if (!loadGraph(argv[1], &g, &qSrc, &qDst)) return 1;
+#if defined(MS5) || defined(MS6)
+static Vector2 blockedOutsidePosition(Vector2 center, int traveler_id) {
+    float angle = ((float)(traveler_id % 8) / 8.0f) * 2.0f * PI;
+    float radius = NODE_RADIUS * 1.8f;
+    return (Vector2){center.x + radius * cosf(angle), center.y + radius * sinf(angle)};
+}
 
+static void childProcessStage5or6(int traveler_id, TravelerDef traveler, Graph *g, int write_fd, Vector2 positions[]) {
+    pid_t pid = getpid();
     int parent[MAX_NODES];
-    bool onPath[MAX_NODES][MAX_NODES] = {0};
-    int totalDist = dijkstra(&g, qSrc, qDst, parent);
-    bool pathFound = (totalDist != INF || qSrc == qDst);
-    
-    if (pathFound && qSrc != qDst) markPath(parent, qDst, onPath);
+    int path[MAX_NODES];
+    int path_len = 0;
+    int dist = dijkstra(g, traveler.source, traveler.destination, parent);
+    if (dist == INF) {
+        sendDone(write_fd, pid, traveler_id, traveler.source, positions[traveler.source].x, positions[traveler.source].y);
+        close(write_fd);
+        exit(0);
+    }
+    buildPath(parent, traveler.destination, path, &path_len);
 
-    /* Build Forward Path Array for Animation */
-    int pathArr[MAX_NODES];
-    int pathLen = 0;
-    if (pathFound) {
-        int cur = qDst;
-        while (cur != -1) { pathArr[pathLen++] = cur; cur = parent[cur]; }
-        /* Reverse array */
-        for (int i = 0; i < pathLen / 2; i++) {
-            int temp = pathArr[i];
-            pathArr[i] = pathArr[pathLen - 1 - i];
-            pathArr[pathLen - 1 - i] = temp;
-        }
+    if (path_len == 0) {
+        sendDone(write_fd, pid, traveler_id, traveler.source, positions[traveler.source].x, positions[traveler.source].y);
+        close(write_fd);
+        exit(0);
     }
 
-    InitWindow(SCREEN_W, SCREEN_H, "OS Project – Graph Visualizer & Animation (Milestone 3)");
+    int start = path[0];
+#ifdef MS6
+    sem_wait(&node_sems[start]);
+#endif
+    sendArrival(write_fd, pid, traveler_id, start, (path_len > 1) ? path[1] : -1, positions[start].x, positions[start].y);
+
+    if (path_len == 1) {
+#ifdef MS6
+        sleepMs((long)(WAIT_TIME * 1000.0));
+        sem_post(&node_sems[start]);
+#endif
+        sendDone(write_fd, pid, traveler_id, start, positions[start].x, positions[start].y);
+        close(write_fd);
+        exit(0);
+    }
+
+#ifdef MS6
+    sem_post(&node_sems[start]);
+#endif
+
+    for (int idx = 0; idx < path_len - 1; idx++) {
+        int u = path[idx];
+        int v = path[idx + 1];
+        int weight = g->weight[u][v];
+        Vector2 from = positions[u];
+        Vector2 to = positions[v];
+
+        for (int step = 1; step <= weight; step++) {
+            float ratio = (float)step / (float)weight;
+            float x = from.x + ratio * (to.x - from.x);
+            float y = from.y + ratio * (to.y - from.y);
+            sendMove(write_fd, pid, traveler_id, u, v, x, y);
+            sleepMs((long)(JUMP_TIME * 1000.0));
+        }
+
+        if (idx + 1 == path_len - 1) {
+#ifdef MS6
+            Vector2 outside = blockedOutsidePosition(to, traveler_id);
+            sendWait(write_fd, pid, traveler_id, u, v, outside.x, outside.y, STATE_BLOCKED);
+            sem_wait(&node_sems[v]);
+#endif
+            sendArrival(write_fd, pid, traveler_id, v, -1, to.x, to.y);
+#ifdef MS6
+            sleepMs((long)(WAIT_TIME * 1000.0));
+            sem_post(&node_sems[v]);
+#endif
+            sendDone(write_fd, pid, traveler_id, v, to.x, to.y);
+            break;
+        }
+
+#ifdef MS6
+        Vector2 outside = blockedOutsidePosition(to, traveler_id);
+        sendWait(write_fd, pid, traveler_id, u, v, outside.x, outside.y, STATE_BLOCKED);
+        sem_wait(&node_sems[v]);
+#endif
+        sendArrival(write_fd, pid, traveler_id, v, path[idx + 2], to.x, to.y);
+#ifdef MS6
+        sleepMs((long)(WAIT_TIME * 1000.0));
+        sem_post(&node_sems[v]);
+#endif
+    }
+
+    close(write_fd);
+    exit(0);
+}
+#endif
+
+static void updateTravelerFromMessage(Traveler *traveler, const IPCMessage *msg) {
+    traveler->pid = msg->pid;
+    traveler->current_node = msg->current_node;
+    traveler->next_node = msg->next_node;
+    traveler->x = msg->x;
+    traveler->y = msg->y;
+    traveler->state = msg->state;
+    if (msg->event == EVENT_ARRIVE) {
+        printf("[PID=%d] arrived at node %d | next node: %d\n", msg->pid, msg->current_node, msg->next_node);
+    } else if (msg->event == EVENT_DONE) {
+        traveler->finished = true;
+        traveler->state = STATE_FINISHED;
+    }
+}
+
+#if defined(MS5) || defined(MS6)
+static void handlePipeReads(int pipes[][2], Traveler travelers[], int traveler_count, bool pipe_open[]) {
+    for (int i = 0; i < traveler_count; i++) {
+        if (!pipe_open[i]) continue;
+        while (true) {
+            IPCMessage msg;
+            ssize_t bytes = read(pipes[i][0], &msg, sizeof(msg));
+            if (bytes == (ssize_t)sizeof(msg)) {
+                updateTravelerFromMessage(&travelers[i], &msg);
+                continue;
+            }
+            if (bytes == 0) {
+                pipe_open[i] = false;
+                close(pipes[i][0]);
+                break;
+            }
+            if (bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            if (bytes == -1 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+}
+#endif
+
+static void drawGraph(const Graph *g, Vector2 positions[]) {
+    for (int u = 0; u < g->n; u++) {
+        for (int v = 0; v < g->n; v++) {
+            if (g->weight[u][v] == INF) continue;
+            drawArrow(positions[u], positions[v], (Color){140, 140, 160, 255});
+            char text[16];
+            snprintf(text, sizeof(text), "%d", g->weight[u][v]);
+            int textW = MeasureText(text, 18);
+            drawBoldText(text,
+                         (int)((positions[u].x + positions[v].x) * 0.5f) - textW / 2,
+                         (int)((positions[u].y + positions[v].y) * 0.5f) - 10,
+                         18,
+                         SKYBLUE);
+        }
+    }
+    for (int i = 0; i < g->n; i++) {
+        DrawCircle((int)positions[i].x, (int)positions[i].y, NODE_RADIUS, (Color){45, 95, 175, 255});
+        DrawCircleLines((int)positions[i].x, (int)positions[i].y, NODE_RADIUS, WHITE);
+        char label[12];
+        snprintf(label, sizeof(label), "%d", i);
+        DrawText(label, (int)(positions[i].x - MeasureText(label, 20) / 2), (int)(positions[i].y - 10), 20, WHITE);
+    }
+}
+
+static void drawTravelers(Traveler travelers[], int traveler_count) {
+    double blink = sin(GetTime() * 6.0);
+    for (int i = 0; i < traveler_count; i++) {
+        Color fill = travelers[i].color;
+        if (travelers[i].state == STATE_WAITING || travelers[i].state == STATE_BLOCKED) {
+            fill = YELLOW;
+        } else if (travelers[i].state == STATE_FINISHED) {
+            fill = GRAY;
+        }
+        if (travelers[i].state == STATE_BLOCKED && blink > 0.0) {
+            DrawCircle((int)travelers[i].x, (int)travelers[i].y, 18, Fade(fill, 0.5f));
+        }
+        DrawCircle((int)travelers[i].x, (int)travelers[i].y, 12, fill);
+        DrawCircleLines((int)travelers[i].x, (int)travelers[i].y, 12, WHITE);
+        DrawText(TextFormat("T%d", travelers[i].id), (int)travelers[i].x + 14, (int)travelers[i].y - 8, 16, WHITE);
+    }
+}
+
+#if !defined(MS5) && !defined(MS6)
+static void updateSimpleAnimation(Traveler *traveler, const Graph *g, Vector2 positions[]) {
+    if (traveler->finished || traveler->path_len <= 1) {
+        if (traveler->path_len <= 1) {
+            traveler->finished = true;
+            traveler->state = STATE_FINISHED;
+        }
+        return;
+    }
+    int idx = traveler->path_index;
+    int current = traveler->path[idx];
+    int next = traveler->path[idx + 1];
+    int weight = g->weight[current][next];
+    double now = GetTime();
+
+    if (weight <= 0) {
+        traveler->path_index++;
+        traveler->current_node = next;
+        traveler->next_node = (traveler->path_index < traveler->path_len - 1) ? traveler->path[traveler->path_index + 1] : -1;
+        traveler->jump_count = 0;
+        traveler->state = STATE_WAITING;
+        traveler->last_time = now;
+        return;
+    }
+
+    if (traveler->state == STATE_ACTIVE) {
+        if (now - traveler->last_time >= JUMP_TIME) {
+            traveler->jump_count++;
+            traveler->last_time = now;
+            if (traveler->jump_count > weight) {
+                traveler->jump_count = weight;
+            }
+        }
+        float ratio = (float)traveler->jump_count / (float)weight;
+        traveler->x = positions[current].x + ratio * (positions[next].x - positions[current].x);
+        traveler->y = positions[current].y + ratio * (positions[next].y - positions[current].y);
+
+        if (traveler->jump_count >= weight) {
+            traveler->path_index++;
+            traveler->current_node = next;
+            traveler->next_node = (traveler->path_index < traveler->path_len - 1) ? traveler->path[traveler->path_index + 1] : -1;
+            traveler->state = STATE_WAITING;
+            traveler->jump_count = 0;
+            traveler->last_time = now;
+        }
+    } else if (traveler->state == STATE_WAITING) {
+        if (now - traveler->last_time >= WAIT_TIME) {
+            if (traveler->path_index >= traveler->path_len - 1) {
+                traveler->finished = true;
+                traveler->state = STATE_FINISHED;
+            } else {
+                traveler->state = STATE_ACTIVE;
+                traveler->last_time = now;
+            }
+        }
+    }
+}
+#endif
+
+#if !defined(MS5) && !defined(MS6)
+static void runStage4(Graph *g, TravelerDef defs[], int traveler_count, Vector2 positions[]) {
+    Traveler travelers[MAX_TRAVELERS];
+    initializeTravelers(travelers, defs, traveler_count, positions);
+    computePathsInParent(g, travelers, traveler_count);
+
+    pid_t child_pids[MAX_TRAVELERS];
+    for (int i = 0; i < traveler_count; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(1);
+        }
+        if (pid == 0) {
+            childProcessStage4(i, travelers[i], g);
+        }
+        child_pids[i] = pid;
+        travelers[i].pid = pid;
+    }
+
+    InitWindow(SCREEN_W, SCREEN_H, "Flight Path Simulation - Milestone 4");
     SetTargetFPS(60);
 
-    float cx = SCREEN_W / 2.0f;
-    float cy = SCREEN_H / 2.0f - 20.0f;
-    float r  = (SCREEN_H < SCREEN_W ? SCREEN_H : SCREEN_W) * 0.33f;
-    Vec2 pos[MAX_NODES];
-    for (int i = 0; i < g.n; i++) pos[i] = nodePos(i, g.n, cx, cy, r);
-
-    Color bgColor      = { 18,  18,  35, 255 };  
-    Color edgeColor    = { 140, 140, 160, 255 };  
-    Color pathColor    = { 255, 210,  50, 255 };  
-    Color nodeColor    = {  55,  90, 180, 255 };  
-    Color srcNodeColor = {  40, 180,  90, 255 };  
-    Color dstNodeColor = { 220,  60,  60, 255 };  
-    Color nodeText     = WHITE;
-    Color weightColor  = { 210, 230, 255, 255 };  
-    Color pathEdgeW    = { 255, 235, 120, 255 };
-    Color entityColor  = { 255, 100, 200, 255 };  /* Pink for moving entity */
-
-    /* Animation Variables */
-    AnimState animState = ANIM_IDLE;
-    if (!pathFound) animState = ANIM_NO_PATH;
-    else if (qSrc == qDst) animState = ANIM_FINISHED;
-
-    bool isPlaying = false;
-    int pathIdx = 0;     /* Current position in pathArr */
-    int jumpCount = 0;   /* Jumps completed on current edge */
-    double lastTime = GetTime();
-
-    Rectangle btnPlay = { SCREEN_W - 140, 20, 110, 40 };
-
     while (!WindowShouldClose()) {
-        double currentTime = GetTime();
-
-        /* --- Handle Input --- */
-        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-            if (CheckCollisionPointRec(GetMousePosition(), btnPlay)) {
-                if (animState != ANIM_FINISHED && animState != ANIM_NO_PATH) {
-                    isPlaying = !isPlaying;
-                    lastTime = currentTime; /* Reset timer when toggled */
-                }
+        bool anyActive = false;
+        for (int i = 0; i < traveler_count; i++) {
+            if (!travelers[i].finished) {
+                anyActive = true;
+                updateSimpleAnimation(&travelers[i], g, positions);
             }
         }
 
-        /* --- Animation Logic --- */
-        if (isPlaying && pathLen > 1) {
-            if (animState == ANIM_IDLE) {
-                animState = ANIM_JUMPING;
-                lastTime = currentTime;
-                jumpCount = 1;
-            } 
-            else if (animState == ANIM_JUMPING) {
-                if (currentTime - lastTime >= JUMP_TIME) {
-                    lastTime = currentTime;
-                    int u = pathArr[pathIdx];
-                    int v = pathArr[pathIdx + 1];
-                    int w = g.weight[u][v];
-
-                    if (jumpCount < w) {
-                        jumpCount++;
-                    } else {
-                        /* Reached next node */
-                        pathIdx++;
-                        if (pathIdx == pathLen - 1) {
-                            animState = ANIM_FINISHED;
-                            isPlaying = false;
-                        } else {
-                            animState = ANIM_WAITING;
-                        }
-                    }
-                }
-            }
-            else if (animState == ANIM_WAITING) {
-                if (currentTime - lastTime >= WAIT_TIME) {
-                    lastTime = currentTime;
-                    animState = ANIM_JUMPING;
-                    jumpCount = 1;
-                }
-            }
-        }
-
-        /* --- Drawing --- */
         BeginDrawing();
-        ClearBackground(bgColor);
-        DrawText("Graph Animation – Milestone 3", 16, 12, 20, LIGHTGRAY);
-
-        /* Draw Play/Stop Button */
-        Color btnColor = isPlaying ? MAROON : DARKGREEN;
-        if (animState == ANIM_FINISHED || animState == ANIM_NO_PATH) btnColor = GRAY;
-        DrawRectangleRec(btnPlay, btnColor);
-        DrawText(isPlaying ? "STOP" : "PLAY", btnPlay.x + 30, btnPlay.y + 10, 20, WHITE);
-
-        /* Draw Edges */
-        for (int u = 0; u < g.n; u++) {
-            for (int v = 0; v < g.n; v++) {
-                if (g.weight[u][v] == INF) continue;
-                bool highlight = pathFound && onPath[u][v];
-                drawArrow(pos[u], pos[v], highlight ? pathColor : edgeColor);
-
-                float mx = (pos[u].x + pos[v].x) / 2.0f;
-                float my = (pos[u].y + pos[v].y) / 2.0f;
-                char wBuf[16];
-                snprintf(wBuf, sizeof(wBuf), "%d", g.weight[u][v]);
-
-                int fontSize = 26;
-                int textW = MeasureText(wBuf, fontSize);
-                int tx = (int)(mx - textW / 2);
-                int ty = (int)(my - fontSize / 2);
-
-                drawBoldText(wBuf, tx, ty, fontSize, highlight ? pathEdgeW : weightColor);
-            }
-        }
-
-        /* Draw Nodes */
-        for (int i = 0; i < g.n; i++) {
-            Color nc = nodeColor;
-            if (i == qSrc) nc = srcNodeColor;
-            if (i == qDst) nc = dstNodeColor;
-            if (i == qSrc && i == qDst) nc = pathColor;
-
-            if (i == qSrc || i == qDst) {
-                Color ring = nc; ring.a = 80;
-                DrawCircle((int)pos[i].x, (int)pos[i].y, NODE_RADIUS + 8, ring);
-            }
-            DrawCircle((int)pos[i].x, (int)pos[i].y, NODE_RADIUS, nc);
-            DrawCircleLines((int)pos[i].x, (int)pos[i].y, NODE_RADIUS, WHITE);
-
-            char label[8];
-            snprintf(label, sizeof(label), "%d", i);
-            DrawText(label, (int)(pos[i].x - MeasureText(label, 20) / 2), (int)(pos[i].y - 10), 20, nodeText);
-        }
-
-        /* Draw Moving Entity */
-        if (pathFound) {
-            Vec2 ePos = pos[qSrc]; /* Default to source */
-            
-            if (animState == ANIM_FINISHED) {
-                ePos = pos[qDst];
-            } 
-            else if (animState == ANIM_WAITING) {
-                ePos = pos[pathArr[pathIdx]];
-            }
-            else if (animState == ANIM_JUMPING) {
-                int u = pathArr[pathIdx];
-                int v = pathArr[pathIdx + 1];
-                int w = g.weight[u][v];
-                float fraction = (float)jumpCount / w;
-                if (fraction > 1.0f) fraction = 1.0f;
-                
-                ePos.x = pos[u].x + fraction * (pos[v].x - pos[u].x);
-                ePos.y = pos[u].y + fraction * (pos[v].y - pos[u].y);
-            }
-
-            /* Draw the entity (Circle with an inner ring) */
-            DrawCircle((int)ePos.x, (int)ePos.y, 16, entityColor);
-            DrawCircleLines((int)ePos.x, (int)ePos.y, 16, WHITE);
-            DrawCircle((int)ePos.x, (int)ePos.y, 6, WHITE);
-        }
-
-        /* --- Arrival Message --- */
-        if (animState == ANIM_FINISHED && pathLen > 1) {
-            int msgW = MeasureText("Destination Reached!", 30);
-            DrawRectangle(SCREEN_W/2 - msgW/2 - 20, 80, msgW + 40, 50, Fade(BLACK, 0.7f));
-            DrawText("Destination Reached!", SCREEN_W/2 - msgW/2, 90, 30, GREEN);
-        }
-
-        /* --- Info Panel (Bottom) --- */
-        int panelY = SCREEN_H - 90;
-        DrawRectangle(0, panelY, SCREEN_W, 90, (Color){ 10, 10, 25, 200 });
-        DrawLine(0, panelY, SCREEN_W, panelY, DARKGRAY);
-
-        DrawCircle(30, panelY + 22, 10, srcNodeColor); DrawText("Source", 46, panelY + 15, 16, LIGHTGRAY);
-        DrawCircle(130, panelY + 22, 10, dstNodeColor); DrawText("Destination", 146, panelY + 15, 16, LIGHTGRAY);
-        DrawRectangle(260, panelY + 14, 32, 6, pathColor); DrawText("Shortest path", 300, panelY + 15, 16, LIGHTGRAY);
-        DrawCircle(440, panelY + 22, 10, entityColor); DrawText("Entity", 456, panelY + 15, 16, LIGHTGRAY);
-
-        char info[128];
-        if (!pathFound) snprintf(info, sizeof(info), "No path found from %d to %d", qSrc, qDst);
-        else if (qSrc == qDst) snprintf(info, sizeof(info), "Source = Destination = %d | Distance: 0", qSrc);
-        else snprintf(info, sizeof(info), "Total distance: %d | Jumps total time: %.1fs", totalDist, totalDist * JUMP_TIME);
-        
-        DrawText(info, 16, panelY + 46, 18, WHITE);
-        
+        ClearBackground((Color){18, 24, 40, 255});
+        DrawText("Flight Path Simulation - Milestone 4", 16, 16, 20, LIGHTGRAY);
+        drawGraph(g, positions);
+        drawTravelers(travelers, traveler_count);
         EndDrawing();
+
+        if (!anyActive) break;
     }
 
     CloseWindow();
+    for (int i = 0; i < traveler_count; i++) {
+        waitpid(child_pids[i], NULL, 0);
+    }
+}
+#endif
+
+#if defined(MS5) || defined(MS6)
+static void runStage5or6(Graph *g, TravelerDef defs[], int traveler_count, Vector2 positions[]) {
+#ifdef MS6
+    if (!initNodeSemaphores(g->n)) {
+        return;
+    }
+#endif
+    Traveler travelers[MAX_TRAVELERS];
+    initializeTravelers(travelers, defs, traveler_count, positions);
+
+    int pipes[MAX_TRAVELERS][2];
+    bool pipe_open[MAX_TRAVELERS];
+    pid_t child_pids[MAX_TRAVELERS];
+
+    for (int i = 0; i < traveler_count; i++) {
+        if (pipe(pipes[i]) != 0) {
+            perror("pipe");
+            exit(1);
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(1);
+        }
+        if (pid == 0) {
+            close(pipes[i][0]);
+            childProcessStage5or6(i, defs[i], g, pipes[i][1], positions);
+        }
+        close(pipes[i][1]);
+        if (!setNonBlocking(pipes[i][0])) {
+            perror("fcntl");
+            exit(1);
+        }
+        child_pids[i] = pid;
+        travelers[i].pid = pid;
+        pipe_open[i] = true;
+    }
+
+    InitWindow(SCREEN_W, SCREEN_H, "Flight Path Simulation - Milestone 5/6");
+    SetTargetFPS(60);
+
+    while (!WindowShouldClose()) {
+        handlePipeReads(pipes, travelers, traveler_count, pipe_open);
+        bool anyActive = false;
+        for (int i = 0; i < traveler_count; i++) {
+            if (!travelers[i].finished) anyActive = true;
+        }
+
+        BeginDrawing();
+        ClearBackground((Color){18, 24, 40, 255});
+        DrawText("Flight Path Simulation - Milestone 5/6", 16, 16, 20, LIGHTGRAY);
+        drawGraph(g, positions);
+        drawTravelers(travelers, traveler_count);
+        EndDrawing();
+
+        if (!anyActive) break;
+    }
+
+    CloseWindow();
+    for (int i = 0; i < traveler_count; i++) {
+        waitpid(child_pids[i], NULL, 0);
+        if (pipe_open[i]) {
+            close(pipes[i][0]);
+        }
+    }
+#ifdef MS6
+    destroyNodeSemaphores(g->n);
+#endif
+}
+#endif
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <file_name>\n", argv[0]);
+        return 1;
+    }
+
+    Graph graph;
+    TravelerDef traveler_defs[MAX_TRAVELERS];
+    int traveler_count = 0;
+    if (!loadGraph(argv[1], &graph, traveler_defs, &traveler_count)) {
+        return 1;
+    }
+    if (traveler_count <= 0) {
+        fprintf(stderr, "No travelers configured in input file\n");
+        return 1;
+    }
+
+    Vector2 positions[MAX_NODES];
+    float cx = SCREEN_W / 2.0f;
+    float cy = SCREEN_H / 2.0f - 30.0f;
+    float radius = (SCREEN_H < SCREEN_W ? SCREEN_H : SCREEN_W) * 0.36f;
+    for (int i = 0; i < graph.n; i++) {
+        positions[i] = nodePosition(i, graph.n, cx, cy, radius);
+    }
+
+#if defined(MS4)
+    runStage4(&graph, traveler_defs, traveler_count, positions);
+#elif defined(MS5) || defined(MS6)
+    runStage5or6(&graph, traveler_defs, traveler_count, positions);
+#else
+    runStage4(&graph, traveler_defs, traveler_count, positions);
+#endif
+
     return 0;
 }

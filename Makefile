@@ -15,17 +15,17 @@ all: milestone4
 milestone1:
 	$(CC) $(CFLAGS) dijkstra.c -o dijkstra
 milestone2:
-	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) sim.c -o sim.exe $(LIBS)
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) sim.c -o sim $(LIBS)
 milestone3:
-	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) sim.c -o sim.exe $(LIBS)
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) sim.c -o sim $(LIBS)
 
-# المراحل الجديدة (تطلب بناء نفس البرنامج ولكن بتفعيل خصائص الـ OS)
+# المراحل الجديدة (تطلب بناء نفس البرنامج אך בתהליך OS)
 milestone4:
-	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS4 sim.c -o sim.exe $(LIBS)
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS4 sim.c -o sim $(LIBS)
 milestone5:
-	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS5 sim.c -o sim.exe $(LIBS)
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS5 sim.c -o sim $(LIBS)
 milestone6:
-	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS6 sim.c -o sim.exe $(LIBS)
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS6 sim.c -o sim $(LIBS)
 
 clean:
 	rm -f dijkstra sim sim.exe sim4 sim5 sim6 *.o

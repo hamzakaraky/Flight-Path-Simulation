@@ -49,7 +49,7 @@ make milestone2
 ```
 Run:
 ```bash
-./sim.exe <input_file>
+./sim <input_file>
 ```
 
 ## Milestone 3 — Animated Traveler
@@ -60,7 +60,7 @@ make milestone3
 ```
 Run:
 ```bash
-./sim.exe <input_file>
+./sim <input_file>
 ```
 
 ## Milestone 4 — Multi-Traveler with fork()
@@ -74,13 +74,14 @@ make milestone4
 ```
 Run:
 ```bash
-./sim.exe multi.txt
+./sim multi.txt
 ```
 
 ## Milestone 5 — IPC via pipes
 
-Child processes send real-time position/state updates to the parent over
-non-blocking pipes. The GUI reflects live child process state.
+* **IPC Mechanism**: Non-blocking anonymous pipes. For each traveler, the parent process creates a pipe (`pipe()`) and forks a child process. The child process writes state updates (`IPCMessage` structs containing PID, current/next node, coordinates, state, and events) to its write-end, while the parent reads them from its read-end.
+* **Non-blocking Reads**: The parent sets the read-end of each pipe to non-blocking mode (`O_NONBLOCK` via `fcntl`) to keep the GUI rendering smoothly at 60 FPS without waiting for child writes.
+* **GUI Updates**: The parent processes child updates in real-time and updates the UI accordingly.
 
 Build:
 ```bash
@@ -88,14 +89,17 @@ make milestone5
 ```
 Run:
 ```bash
-./sim.exe multi.txt
+./sim multi.txt
 ```
 
 ## Milestone 6 — Semaphore-based node locking
 
-Adds one process-shared semaphore per node (via mmap + sem_init pshared=1).
-Travelers must acquire the destination node's semaphore before entering it,
-preventing simultaneous occupation.
+* **Synchronization Mechanism**: Process-shared POSIX semaphores (`sem_t`).
+* **Shared Memory Allocation**: The parent allocates memory for `MAX_NODES` semaphores in a shared memory region using anonymous memory mapping (`mmap` with `MAP_SHARED | MAP_ANONYMOUS`).
+* **Semaphore Initialization**: Each semaphore is initialized with `pshared = 1` (via `sem_init`), allowing it to be shared between the parent and child processes.
+* **Locking Logic**: Before entering any node (including intermediate and destination nodes), the traveler process calculates a waiting position outside the node border, updates the parent to display the traveler at this waiting position in a flashing `STATE_BLOCKED` state, and calls `sem_wait(&node_sems[node_id])`.
+* **Critical Section**: Once the semaphore is acquired, the traveler enters the node, notifies the parent of its arrival, stays inside for exactly 1.0 second (`sleepMs(1000)`), and then releases the lock using `sem_post(&node_sems[node_id])`.
+* **Stress Test**: A test input `sync_test.txt` is provided to simulate 3 travelers competing for the same node (node 2) simultaneously, demonstrating mutual exclusion, queueing outside the node, and sequential entry.
 
 Build:
 ```bash
@@ -103,8 +107,8 @@ make milestone6
 ```
 Run:
 ```bash
-./sim.exe sync_test.txt    # stress test: 3 travelers competing for node 2
-./sim.exe multi.txt        # 3 travelers, 7-node graph
+./sim sync_test.txt    # stress test: 3 travelers competing for node 2
+./sim multi.txt        # 3 travelers, 7-node graph
 ```
 
 ## Input Format

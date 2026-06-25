@@ -3,11 +3,11 @@ CC      = gcc
 # M2-M6: sim.c uses POSIX APIs (fork, pipe, mmap, semaphores) that only
 #         the MSYS2 POSIX gcc (usr/bin) supports on Windows.
 #         Raylib headers/libs are taken from the UCRT64 package.
-CC_SIM  = /c/msys64/usr/bin/gcc
+CC_SIM  = gcc
 CFLAGS  = -Wall -Wextra -std=c99
-IFLAGS  = -I/c/msys64/ucrt64/include
-LFLAGS  = -L/c/msys64/ucrt64/lib
-LIBS    = -lraylib -lwinmm -lgdi32 -lm -lpthread
+IFLAGS  = 
+LFLAGS  = 
+LIBS    = -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
 
 all: milestone4
 
@@ -26,6 +26,8 @@ milestone5:
 	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS5 sim.c -o sim $(LIBS)
 milestone6:
 	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS6 sim.c -o sim $(LIBS)
+milestone7:
+	$(CC_SIM) $(CFLAGS) $(IFLAGS) $(LFLAGS) -DMS7 sim.c -o sim $(LIBS)
 
 clean:
 	rm -f dijkstra sim sim.exe sim4 sim5 sim6 *.o

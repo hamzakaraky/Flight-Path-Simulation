@@ -1240,6 +1240,20 @@ static void updateTravelerFromMessage(Traveler *traveler, const IPCMessage *msg)
     }
 
     traveler->pid = msg->pid;
+    traveler->current_node = msg->current_node;
+    traveler->next_node = msg->next_node;
+    traveler->x = msg->x;
+    traveler->y = msg->y;
+    traveler->state = msg->state;
+
+    if (msg->event == EVENT_DONE) {
+        traveler->finished = true;
+    }
+
+    if (msg->event == EVENT_ARRIVE) {
+        printf("[PID=%d] arrived at node %d | next node: %d\n",
+               msg->pid, msg->current_node, msg->next_node);
+    }
 }
 
 #if defined(MS5) || defined(MS6) || defined(MS7)

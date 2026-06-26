@@ -356,12 +356,27 @@ static void enterNode(int node, int traveler_id, int burst) {
  * never slip in between a vacate and the next scheduling decision. */
 static void scheduleNext(int node) {
     NodeQueue *q = &node_queues[node];
+    /* Human-readable name of the active policy, for the trace prints below. */
+    const char *algo = (g_sched == SCHED_SJF) ? "SJF" : "FCFS";
     sem_wait(&q->mutex);
     if (q->queue_len == 0) {
         q->occupied = 0;
+        /* Scheduler decision trace: node freed, nobody was waiting. */
+        printf("[SCHED %s] node %d vacated -> queue empty, marking node FREE\n",
+               algo, node);
+        fflush(stdout);
         sem_post(&q->mutex);
         return;
     }
+    /* Scheduler decision trace: list every traveler currently waiting on
+     * this node together with its burst (remaining hop count) so the choice
+     * below can be followed. */
+    printf("[SCHED %s] node %d vacated -> waiting:", algo, node);
+    for (int i = 0; i < q->queue_len; i++) {
+        int t = q->queue[i];
+        printf(" T%d(burst=%d)", t, q->arrival_time[t]);
+    }
+    printf("\n");
     /* FCFS: pick index 0, i.e. whoever has been in queue[] longest (queue
      * order doubles as arrival order). SJF: scan for the queued traveler
      * with the smallest stored burst (remaining hops), i.e. the "shortest
@@ -375,6 +390,17 @@ static void scheduleNext(int node) {
         }
     }
     int traveler_id = q->queue[pick];
+    /* Scheduler decision trace: who won and why, per the active policy. */
+    if (g_sched == SCHED_SJF) {
+        printf("[SCHED SJF] node %d -> chose T%d (shortest job: smallest "
+               "remaining hops = %d)\n",
+               node, traveler_id, q->arrival_time[traveler_id]);
+    } else {
+        printf("[SCHED FCFS] node %d -> chose T%d (first to arrive: head of "
+               "the queue)\n",
+               node, traveler_id);
+    }
+    fflush(stdout);
     /* Remove the chosen entry by shifting the rest of the queue down one
      * slot (queue[] is a small flat array, not a ring buffer). */
     for (int i = pick; i < q->queue_len - 1; i++) {

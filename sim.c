@@ -119,9 +119,9 @@ typedef enum {
     EVENT_ARRIVE,
     EVENT_WAIT,
     EVENT_DONE,
+    EVENT_NO_PATH,
     EVENT_VACATE,
 } EventType;
-
 /* MS5/MS6/MS7: fixed-size message a child process writes down its pipe
  * to report progress; consumed by handlePipeReads()/updateTravelerFromMessage()
  * in the parent. Plain struct (no pointers) so it is safe to write()/read()
@@ -831,6 +831,10 @@ static void sendDone(int fd, pid_t pid, int traveler_id, int current_node, float
     IPCMessage msg = {pid, traveler_id, current_node, -1, x, y, STATE_FINISHED, EVENT_DONE};
     writeMessage(fd, &msg);
 }
+static void sendNoPath(int fd, pid_t pid, int traveler_id, int source, int destination, float x, float y) {
+    IPCMessage msg = {pid, traveler_id, source, destination, x, y, STATE_FINISHED, EVENT_NO_PATH};
+    writeMessage(fd, &msg);
+}
 
 #ifdef MS7
 /* Milestone 7.
@@ -1005,14 +1009,22 @@ static void childProcessStage5or6(int traveler_id, TravelerDef traveler, Graph *
     int path_len = 0;
     int dist = dijkstra(g, traveler.source, traveler.destination, parent);
     if (dist == INF) {
-        sendDone(write_fd, pid, traveler_id, traveler.source, positions[traveler.source].x, positions[traveler.source].y);
+        sendNoPath(write_fd, pid, traveler_id,
+                   traveler.source,
+                   traveler.destination,
+                   positions[traveler.source].x,
+                   positions[traveler.source].y);
         close(write_fd);
         exit(0);
     }
     buildPath(parent, traveler.destination, path, &path_len);
 
     if (path_len == 0) {
-        sendDone(write_fd, pid, traveler_id, traveler.source, positions[traveler.source].x, positions[traveler.source].y);
+        sendNoPath(write_fd, pid, traveler_id,
+                   traveler.source,
+                   traveler.destination,
+                   positions[traveler.source].x,
+                   positions[traveler.source].y);
         close(write_fd);
         exit(0);
     }
@@ -1206,31 +1218,28 @@ static void childProcessStage7(int traveler_id, TravelerDef traveler, Graph *g, 
  * line; for EVENT_VACATE under MS7, calls scheduleNext() (which may wake
  * another child process via sem_post). */
 static void updateTravelerFromMessage(Traveler *traveler, const IPCMessage *msg) {
+    if (msg->event == EVENT_NO_PATH) {
+        traveler->pid = msg->pid;
+        traveler->current_node = msg->current_node;
+        traveler->next_node = msg->next_node;
+        traveler->x = msg->x;
+        traveler->y = msg->y;
+        traveler->state = STATE_FINISHED;
+        traveler->finished = true;
+
+        printf("[PID=%d] traveler %d has NO PATH from node %d to node %d\n",
+               msg->pid, msg->traveler_id, msg->current_node, msg->next_node);
+        return;
+    }
+
     if (msg->event == EVENT_VACATE) {
 #ifdef MS7
-        /* EVENT_VACATE -> scheduleNext() handshake: the child already
-         * left msg->current_node (that field is reused to carry the
-         * vacated node id here, not an actual position), so the parent
-         * immediately lets the scheduler hand it to the next waiter, if
-         * any. Returning here without touching `traveler` is deliberate:
-         * this message carries no real x/y/state for the traveler. */
         scheduleNext(msg->current_node);
 #endif
         return;
     }
+
     traveler->pid = msg->pid;
-    traveler->current_node = msg->current_node;
-    traveler->next_node = msg->next_node;
-    traveler->x = msg->x;
-    traveler->y = msg->y;
-    traveler->state = msg->state;
-    if (msg->event == EVENT_ARRIVE) {
-        printf("[PID=%d] arrived at node %d | next node: %d\n", msg->pid, msg->current_node, msg->next_node);
-    } else if (msg->event == EVENT_DONE) {
-        traveler->finished = true;
-        traveler->state = STATE_FINISHED;
-    }
-}
 
 #if defined(MS5) || defined(MS6) || defined(MS7)
 /* Milestone 5/6/7 (parent-side IPC handler).

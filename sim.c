@@ -1240,6 +1240,7 @@ static void updateTravelerFromMessage(Traveler *traveler, const IPCMessage *msg)
     }
 
     traveler->pid = msg->pid;
+}
 
 #if defined(MS5) || defined(MS6) || defined(MS7)
 /* Milestone 5/6/7 (parent-side IPC handler).
@@ -1512,18 +1513,6 @@ static void runStage5or6(Graph *g, TravelerDef defs[], int traveler_count, Vecto
     initializeTravelers(travelers, defs, traveler_count, positions);
 
     int pipes[MAX_TRAVELERS][2];
-    int ack_pipes[MAX_TRAVELERS][2];          // add near: int pipes[MAX_TRAVELERS][2];
-...
-pipe(pipes[i]);
-pipe(ack_pipes[i]);                       // ADD
-pid_t pid = fork();
-if (pid == 0) {                           // child
-    close(pipes[i][0]);
-    close(ack_pipes[i][1]);               // ADD
-    childProcessStage5or6(i, defs[i], g, pipes[i][1], ack_pipes[i][0], positions); // pass ack read end
-}
-close(pipes[i][1]);
-close(ack_pipes[i][0]);                   // ADD
     bool pipe_open[MAX_TRAVELERS];
     pid_t child_pids[MAX_TRAVELERS];
 
